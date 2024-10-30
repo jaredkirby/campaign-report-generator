@@ -39,6 +39,8 @@ input_offsite_csv: "path/to/your/input.csv"
 output_dir: "path/to/output/directory"
 ```
 
+Create **`reports`** and **`output`** directories in the project directory to store the input files and generated outputs, respectively.
+
 ## Input File Format
 
 The tool expects a CSV file with the following columns:
