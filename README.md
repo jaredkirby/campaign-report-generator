@@ -25,7 +25,7 @@ A Python-based tool that generates formatted Markdown and email reports for trac
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/campaign-report-generator.git
+git clone https://github.com/jaredkirby/campaign-report-generator.git
 cd campaign-report-generator
 ```
 
