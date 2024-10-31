@@ -1,2 +1,2 @@
-input_offsite_csv: "reports/Offsite Media Monthly Audit TOOL.csv"
+input_offsite_csv: "reports/Monthly Audit TOOL.csv"
 output_dir: "output"
