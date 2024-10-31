@@ -178,6 +178,21 @@ Common issues:
    - Ensure recipient addresses are valid
    - Check firewall/security settings
 
+## Improvement TODOs
+   - Create separate modules:
+      - config.py - Configuration handling
+      - data_processing.py - Data loading and processing
+      - report_generators.py - Report generation logic
+      - email_handler.py - Email functionality
+      - utils.py - Shared utilities
+   - Separate constants to congif file.
+   - Improve error handling and logging.
+   - Add context managers for file operations and resource handling.
+   - Add more specific type hints using TypeVar and Protocol.
+   - Use dataclasses for data containers.
+   - Replace string concatenation with f-strings.
+   - Add unit tests for core functions.
+
 ## Contributing
 
 1. Fork the repository
