@@ -13,12 +13,11 @@ import hashlib
 import argparse
 import pandas as pd
 from pathlib import Path
-from datetime import datetime
-from typing import List, Tuple, Optional, Any
+from datetime import datetime, timedelta
+from typing import List, Tuple, Optional, Any, TextIO, Union
 from dataclasses import dataclass
 
 import smtplib
-import logging
 from pathlib import Path
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -73,6 +72,24 @@ class HistoricalDataError(CampaignReportError):
     pass
 
 
+def setup_logging() -> None:
+    """Configure logging format and level"""
+    log_format = "%(asctime)s - %(levelname)s - %(name)s - %(message)s"
+    date_format = "%Y-%m-%d %H:%M:%S"
+
+    # Clear any existing handlers
+    root_logger = logging.getLogger()
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+
+    # Configure logging
+    logging.basicConfig(level=logging.INFO, format=log_format, datefmt=date_format)
+
+    # Reduce logging level for some noisy libraries
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("pandas").setLevel(logging.WARNING)
+
+
 @dataclass
 class EmailConfig:
     """Configuration for email sending"""
@@ -83,6 +100,22 @@ class EmailConfig:
     primary_recipients: List[str] = None
     cc_recipients: List[str] = None
 
+    def __post_init__(self):
+        """Validate configuration after initialization"""
+        if self.primary_recipients is None:
+            self.primary_recipients = []
+        if self.cc_recipients is None:
+            self.cc_recipients = []
+
+        # Validate port number
+        if not isinstance(self.smtp_port, int) or not 0 <= self.smtp_port <= 65535:
+            raise ValueError(f"Invalid SMTP port: {self.smtp_port}")
+
+        # Validate email addresses
+        for email in self.primary_recipients + self.cc_recipients:
+            if not isinstance(email, str) or "@" not in email:
+                raise ValueError(f"Invalid email address: {email}")
+
     @classmethod
     def from_env(cls) -> "EmailConfig":
         """Create EmailConfig from environment variables"""
@@ -90,11 +123,15 @@ class EmailConfig:
         primary_recipients = os.getenv("EMAIL_PRIMARY_RECIPIENTS", "").split(",")
         cc_recipients = os.getenv("EMAIL_CC_RECIPIENTS", "").split(",")
 
-        # Clean up recipient lists
+        # Clean up recipient lists and remove duplicates
         primary_recipients = [
             email.strip() for email in primary_recipients if email.strip()
         ]
-        cc_recipients = [email.strip() for email in cc_recipients if email.strip()]
+        cc_recipients = [
+            email.strip()
+            for email in cc_recipients
+            if email.strip() and email.strip() not in primary_recipients
+        ]
 
         return cls(
             smtp_server=os.getenv("EMAIL_SMTP_SERVER", "smtp.office365.com"),
@@ -129,12 +166,18 @@ class CampaignReportEmailer:
 
     def setup_email_client(self) -> smtplib.SMTP:
         """Initialize and authenticate SMTP client"""
+        server = None
         try:
             server = smtplib.SMTP(self.config.smtp_server, self.config.smtp_port)
             server.starttls()
             server.login(self.config.sender_email, self.sender_password)
             return server
         except Exception as e:
+            if server is not None:
+                try:
+                    server.quit()
+                except:
+                    pass
             self.logger.error(f"Failed to setup email client: {e}")
             raise
 
@@ -181,6 +224,7 @@ class CampaignReportEmailer:
             self.logger.error("Invalid email configuration")
             return False
 
+        server = None
         try:
             # Read the text report content to use as email body
             with open(txt_file_path, "r", encoding="utf-8") as f:
@@ -189,7 +233,7 @@ class CampaignReportEmailer:
             # Create email subject
             subject = f"Campaign Status Report - {report_date}"
 
-            # Setup email server
+            # Setup email server using context management
             server = self.setup_email_client()
 
             # Create message
@@ -200,21 +244,24 @@ class CampaignReportEmailer:
                 txt_file_path=None,  # Don't attach txt version since it's in the body
             )
 
-            # Get all recipients
-            all_recipients = self.config.primary_recipients + self.config.cc_recipients
+            # Send email to all recipients (To and CC recipients are handled by the SMTP server)
+            server.send_message(msg)
 
-            # Send email
-            server.sendmail(self.config.sender_email, all_recipients, msg.as_string())
-
-            server.quit()
             self.logger.info(
-                f"Campaign report email sent successfully to {', '.join(all_recipients)}"
+                f"Campaign report email sent successfully to {msg['To']}"
+                + (f" with CC: {msg['CC']}" if msg.get("CC") else "")
             )
             return True
 
         except Exception as e:
             self.logger.error(f"Failed to send campaign report email: {e}")
             return False
+        finally:
+            if server is not None:
+                try:
+                    server.quit()
+                except:
+                    pass
 
 
 @dataclass
@@ -244,29 +291,29 @@ class Config:
             raise DataValidationError(f"Failed to load configuration: {e}")
 
 
-def setup_logging() -> None:
-    """Configure logging format and level"""
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-    )
-
-
 def get_campaign_hash(row: pd.Series) -> str:
     """
     Create a unique identifier for each campaign based on key fields
 
     Args:
-        row: DataFrame row containing campaign data
+        row: DataFrame row containing campaign data. Must contain:
+            - Tactic Order ID
+            - Retailer
+            - Tactic Brand
+            - Event Name
 
     Returns:
         str: MD5 hash of concatenated key fields
+
+    Raises:
+        KeyError: If any required fields are missing
     """
-    key_fields = [
-        str(row["Tactic Order ID"]),
-        str(row["Retailer"]),
-        str(row["Tactic Brand"]),
-        str(row["Event Name"]),
-    ]
+    required_fields = ["Tactic Order ID", "Retailer", "Tactic Brand", "Event Name"]
+    if not all(field in row.index for field in required_fields):
+        missing = [field for field in required_fields if field not in row.index]
+        raise KeyError(f"Missing required fields for hash calculation: {missing}")
+
+    key_fields = [str(row[field]) for field in required_fields]
     return hashlib.md5("|".join(key_fields).encode()).hexdigest()
 
 
@@ -290,7 +337,7 @@ def validate_file_path(path: Path, file_type: str) -> bool:
     return True
 
 
-def format_budget(amount: float) -> str:
+def format_budget(amount: Union[float, int]) -> str:
     """Format budget amount with currency symbol and thousands separator"""
     return f"${amount:,.2f}"
 
@@ -465,8 +512,15 @@ def find_changes(
     Returns:
         DataFrame: Current data with added change information
     """
+    # If there's no historical data at all, mark all as unchanged
     if historical_df is None:
         return current_df.assign(changes=[[] for _ in range(len(current_df))])
+
+    # If historical data is empty DataFrame, mark all as new
+    if len(historical_df) == 0:
+        return current_df.assign(
+            changes=[["New Campaign"] for _ in range(len(current_df))]
+        )
 
     current_df["hash"] = current_df.apply(get_campaign_hash, axis=1)
     historical_df["hash"] = historical_df.apply(get_campaign_hash, axis=1)
@@ -578,7 +632,7 @@ def get_unique_filename(base_path: Path) -> Path:
 
 
 def write_campaign_details(
-    md_file: Any, campaign: pd.Series, indent_level: int = 0
+    md_file: TextIO, campaign: pd.Series, indent_level: int = 0
 ) -> None:
     """Write campaign details to markdown file"""
     indent = "  " * indent_level
@@ -633,14 +687,41 @@ def write_campaign_section(
         )
         md_file.write(f"**Total Budget: {format_budget(total_budget)}**\n\n")
 
-        for retailer in sorted(campaigns["Retailer"].unique()):
-            retailer_campaigns = campaigns[campaigns["Retailer"] == retailer]
-            retailer_budget = retailer_campaigns["Tactic Allocated Budget"].sum()
+        if section_title == "Upcoming Campaigns":
+            # Group by month for upcoming campaigns
+            campaigns["Month"] = campaigns["Tactic Start Date"].dt.strftime("%B %Y")
+            for month in sorted(campaigns["Month"].unique()):
+                month_campaigns = campaigns[campaigns["Month"] == month]
+                month_budget = month_campaigns["Tactic Allocated Budget"].sum()
 
-            md_file.write(f"## {retailer} ({format_budget(retailer_budget)})\n\n")
+                md_file.write(f"## {month} ({format_budget(month_budget)})\n\n")
 
-            for _, campaign in retailer_campaigns.iterrows():
-                write_campaign_details(md_file, campaign)
+                for retailer in sorted(month_campaigns["Retailer"].unique()):
+                    retailer_campaigns = month_campaigns[
+                        month_campaigns["Retailer"] == retailer
+                    ]
+                    retailer_budget = retailer_campaigns[
+                        "Tactic Allocated Budget"
+                    ].sum()
+
+                    md_file.write(
+                        f"### {retailer} ({format_budget(retailer_budget)})\n\n"
+                    )
+
+                    for _, campaign in retailer_campaigns.iterrows():
+                        write_campaign_details(md_file, campaign)
+
+                md_file.write("\n")
+        else:
+            # Original organization for other sections
+            for retailer in sorted(campaigns["Retailer"].unique()):
+                retailer_campaigns = campaigns[campaigns["Retailer"] == retailer]
+                retailer_budget = retailer_campaigns["Tactic Allocated Budget"].sum()
+
+                md_file.write(f"## {retailer} ({format_budget(retailer_budget)})\n\n")
+
+                for _, campaign in retailer_campaigns.iterrows():
+                    write_campaign_details(md_file, campaign)
 
         md_file.write("---\n\n")
     else:
@@ -653,58 +734,62 @@ def generate_checklist(df: pd.DataFrame, history_dir: Path, output_path: Path) -
     Generate the campaign checklist report
 
     Args:
-        df: Campaign data
+        df: Campaign data (already processed with changes)
         history_dir: Directory containing historical data
         output_path: Path to save the generated report
     """
     logging.info(f"Generating checklist and saving to {output_path}")
     current_date = datetime.now().strftime("%Y-%m-%d")
 
-    # Load historical data and find changes
-    historical_df = load_historical_data(history_dir)
-    df = find_changes(df, historical_df)
-
-    # Save current data as historical
-    save_historical_data(df, history_dir)
-
     # Categorize campaigns
     current_campaigns, future_campaigns, past_campaigns = categorize_campaigns(df)
 
-    with open(output_path, "w", encoding="utf-8") as md_file:
-        md_file.write(f"# Campaign Status Report - Generated on {current_date}\n\n")
+    temp_path = output_path.with_suffix(".tmp")
+    try:
+        with open(temp_path, "w", encoding="utf-8") as md_file:
+            md_file.write(f"# Campaign Status Report - Generated on {current_date}\n\n")
 
-        # Summary section
-        total_budget = df["Tactic Allocated Budget"].sum()
-        total_changes = len([c for c in df["changes"] if c])
-        new_campaigns = len([c for c in df["changes"] if c == ["New Campaign"]])
+            # Summary section
+            total_budget = df["Tactic Allocated Budget"].sum()
+            total_changes = len([c for c in df["changes"] if c])
+            new_campaigns = len([c for c in df["changes"] if c == ["New Campaign"]])
 
-        md_file.write(f"## Summary\n")
-        if total_changes > 0:
+            md_file.write(f"## Summary\n")
+            if total_changes > 0:
+                md_file.write(
+                    f"**🔄 Changes Detected: {total_changes} campaigns updated**\n"
+                )
+            if new_campaigns > 0:
+                md_file.write(f"**🆕 New Campaigns: {new_campaigns}**\n")
+
+            md_file.write(f"- Currently Active Campaigns: {len(current_campaigns)}\n")
+            md_file.write(f"- Upcoming Campaigns: {len(future_campaigns)}\n")
+            md_file.write(f"- Completed Campaigns: {len(past_campaigns)}\n")
             md_file.write(
-                f"**🔄 Changes Detected: {total_changes} campaigns updated**\n"
+                f"- Total Budget Across All Campaigns: {format_budget(total_budget)}\n\n"
             )
-        if new_campaigns > 0:
-            md_file.write(f"**🆕 New Campaigns: {new_campaigns}**\n")
 
-        md_file.write(f"- Currently Active Campaigns: {len(current_campaigns)}\n")
-        md_file.write(f"- Upcoming Campaigns: {len(future_campaigns)}\n")
-        md_file.write(f"- Completed Campaigns: {len(past_campaigns)}\n")
-        md_file.write(
-            f"- Total Budget Across All Campaigns: {format_budget(total_budget)}\n\n"
-        )
+            if total_changes > 0:
+                md_file.write("### Change Indicators:\n")
+                md_file.write("- ⚠️ Campaign has changes\n")
+                md_file.write("- 🆕 New campaign\n")
+                md_file.write("- 🔄 Number of changes in section\n\n")
 
-        if total_changes > 0:
-            md_file.write("### Change Indicators:\n")
-            md_file.write("- ⚠️ Campaign has changes\n")
-            md_file.write("- 🆕 New campaign\n")
-            md_file.write("- 🔄 Number of changes in section\n\n")
+            md_file.write("---\n\n")
 
-        md_file.write("---\n\n")
-
-        # Write each section
-        write_campaign_section(md_file, current_campaigns, "Currently Active Campaigns")
-        write_campaign_section(md_file, future_campaigns, "Upcoming Campaigns")
-        write_campaign_section(md_file, past_campaigns, "Completed Campaigns")
+            # Write each section
+            write_campaign_section(
+                md_file, current_campaigns, "Currently Active Campaigns"
+            )
+            write_campaign_section(md_file, future_campaigns, "Upcoming Campaigns")
+            write_campaign_section(md_file, past_campaigns, "Completed Campaigns")
+            pass
+        # Atomic rename for safer file writing
+        temp_path.replace(output_path)
+    except Exception as e:
+        if temp_path.exists():
+            temp_path.unlink()
+        raise
 
 
 def write_email_section(
@@ -725,15 +810,46 @@ def write_email_section(
         lines.append(f"{indent}Total Budget: {format_budget(total_budget)}")
         lines.append("")
 
-        for retailer in sorted(campaigns["Retailer"].unique()):
-            retailer_campaigns = campaigns[campaigns["Retailer"] == retailer]
-            retailer_budget = retailer_campaigns["Tactic Allocated Budget"].sum()
+        if section_title == "UPCOMING CAMPAIGNS":
+            # Group by month for upcoming campaigns
+            campaigns["Month"] = campaigns["Tactic Start Date"].dt.strftime("%B %Y")
+            for month in sorted(campaigns["Month"].unique()):
+                month_campaigns = campaigns[campaigns["Month"] == month]
+                month_budget = month_campaigns["Tactic Allocated Budget"].sum()
 
-            lines.append(f"{indent}{retailer} ({format_budget(retailer_budget)})")
-            lines.append("")
+                lines.append(f"{indent}{month} ({format_budget(month_budget)})")
+                lines.append("")
 
-            for _, campaign in retailer_campaigns.iterrows():
-                lines.append(format_campaign_for_email(campaign, indent_level + 1))
+                for retailer in sorted(month_campaigns["Retailer"].unique()):
+                    retailer_campaigns = month_campaigns[
+                        month_campaigns["Retailer"] == retailer
+                    ]
+                    retailer_budget = retailer_campaigns[
+                        "Tactic Allocated Budget"
+                    ].sum()
+
+                    lines.append(
+                        f"{indent}  {retailer} ({format_budget(retailer_budget)})"
+                    )
+                    lines.append("")
+
+                    for _, campaign in retailer_campaigns.iterrows():
+                        lines.append(
+                            format_campaign_for_email(campaign, indent_level + 2)
+                        )
+
+                lines.append("")
+        else:
+            # Original organization for other sections
+            for retailer in sorted(campaigns["Retailer"].unique()):
+                retailer_campaigns = campaigns[campaigns["Retailer"] == retailer]
+                retailer_budget = retailer_campaigns["Tactic Allocated Budget"].sum()
+
+                lines.append(f"{indent}{retailer} ({format_budget(retailer_budget)})")
+                lines.append("")
+
+                for _, campaign in retailer_campaigns.iterrows():
+                    lines.append(format_campaign_for_email(campaign, indent_level + 1))
 
         lines.append("-" * 80)
         lines.append("")
@@ -803,34 +919,6 @@ def generate_email_report(df: pd.DataFrame, output_path: Path) -> None:
         f.write("\n".join(lines))
 
 
-def generate_reports(
-    df: pd.DataFrame, history_dir: Path, output_dir: Path
-) -> Tuple[Path, Path]:
-    """Generate both markdown and email reports"""
-    logging.info("Generating markdown and email reports")
-
-    # Load historical data and find changes
-    historical_df = load_historical_data(history_dir)
-    df = find_changes(df, historical_df)
-
-    # Save current data as historical
-    save_historical_data(df, history_dir)
-
-    # Create output filenames
-    timestamp = datetime.now().strftime("%Y%m%d")
-    base_md_path = output_dir / f"Campaign_Status_Report_{timestamp}.md"
-    base_email_path = output_dir / f"Campaign_Status_Email_{timestamp}.txt"
-
-    md_path = get_unique_filename(base_md_path)
-    email_path = get_unique_filename(base_email_path)
-
-    # Generate both reports
-    generate_checklist(df, history_dir, md_path)
-    generate_email_report(df, email_path)
-
-    return md_path, email_path
-
-
 def send_reports_by_email(
     md_path: Path,
     txt_path: Path,
@@ -856,6 +944,67 @@ def send_reports_by_email(
         return False
 
 
+def cleanup_old_reports(output_dir: Path, days_to_keep: int = 30) -> None:
+    """
+    Clean up old report files
+
+    Args:
+        output_dir: Directory containing report files
+        days_to_keep: Number of days to keep files (default: 30)
+    """
+    cutoff = datetime.now() - timedelta(days=days_to_keep)
+
+    # Clean up report files
+    patterns = ["Campaign_Status_Report_*.md", "Campaign_Status_Email_*.txt"]
+    for pattern in patterns:
+        for file in output_dir.glob(pattern):
+            try:
+                if file.stat().st_mtime < cutoff.timestamp():
+                    file.unlink()
+                    logging.info(f"Cleaned up old report: {file}")
+            except Exception as e:
+                logging.warning(f"Failed to clean up {file}: {e}")
+
+
+def generate_reports(
+    df: pd.DataFrame,
+    history_dir: Path,
+    output_dir: Path,
+    cleanup_days: Optional[int] = 30,
+) -> Tuple[Path, Path]:
+    """
+    Generate both markdown and email reports
+
+    Args:
+        df: Campaign data
+        history_dir: Directory for historical data
+        output_dir: Directory for output files
+        cleanup_days: Days to keep old reports (None to skip cleanup)
+
+    Returns:
+        Tuple[Path, Path]: Paths to generated markdown and email reports
+    """
+    logging.info("Generating markdown and email reports")
+
+    # Clean up old reports if requested
+    if cleanup_days is not None:
+        cleanup_old_reports(output_dir, cleanup_days)
+
+    # Create output filenames
+    timestamp = datetime.now().strftime("%Y%m%d")
+    base_md_path = output_dir / f"Campaign_Status_Report_{timestamp}.md"
+    base_email_path = output_dir / f"Campaign_Status_Email_{timestamp}.txt"
+
+    md_path = get_unique_filename(base_md_path)
+    email_path = get_unique_filename(base_email_path)
+
+    # Generate both reports
+    generate_checklist(df, history_dir, md_path)
+    generate_email_report(df, email_path)
+
+    return md_path, email_path
+
+
 def main(config_path: str) -> None:
     """
     Main function to run the campaign report generator and send email reports
@@ -873,12 +1022,25 @@ def main(config_path: str) -> None:
         # Read and process data
         df = read_and_clean_data(config.input_csv)
 
-        # Set up history directory
+        # Set up history directory and process changes
         history_dir = config.output_dir / "campaign_history"
         history_dir.mkdir(exist_ok=True)
 
-        # Generate both reports
-        md_path, email_path = generate_reports(df, history_dir, config.output_dir)
+        # Load historical data and find changes once
+        historical_df = load_historical_data(history_dir)
+        df = find_changes(df, historical_df)
+
+        # Save current data as historical
+        save_historical_data(df, history_dir)
+
+        # Generate both reports using the processed dataframe
+        # Add cleanup of reports older than 30 days
+        md_path, email_path = generate_reports(
+            df,
+            history_dir,
+            config.output_dir,
+            cleanup_days=30,  # Can be made configurable through YAML if needed
+        )
         logging.info(
             f"Reports generated and saved to:\nMarkdown: {md_path}\nEmail: {email_path}"
         )
