@@ -1,0 +1,5 @@
+# Input file location
+input_offsite_csv: "path/to/your/input.csv"
+
+# Output directory for reports
+output_dir: "path/to/output/directory"
