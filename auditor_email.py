@@ -37,8 +37,10 @@ REQUIRED_COLUMNS = [
     "Tactic Brand",
     "Event Name",
     "Tactic Name",
+    "Tactic Description",
     "Tactic Product",
     "Tactic Order ID",
+    "Event ID",
     "Tactic Allocated Budget",
 ]
 
@@ -189,7 +191,7 @@ class CampaignReportEmailer:
         txt_file_path: Optional[Path] = None,
     ) -> MIMEMultipart:
         """Create email message with optional attachments"""
-        msg = MIMEMultipart()
+        msg = MIMEMultipart("alternative")  # Changed to alternative for HTML support
         msg["From"] = self.config.sender_email
         msg["To"] = ", ".join(self.config.primary_recipients)
 
@@ -198,8 +200,14 @@ class CampaignReportEmailer:
 
         msg["Subject"] = subject
 
-        # Attach email body
-        msg.attach(MIMEText(email_body, "plain"))
+        # Create plain text and HTML versions
+        text_part = MIMEText(email_body, "plain")
+        html_body = email_body.replace("\n", "<br>")  # Convert newlines to HTML breaks
+        html_part = MIMEText(html_body, "html")
+
+        # Add both versions - email clients will choose the best one to display
+        msg.attach(text_part)
+        msg.attach(html_part)
 
         # Attach files if provided
         for file_path in [p for p in [md_file_path, txt_file_path] if p]:
@@ -358,13 +366,20 @@ def format_campaign_for_email(campaign: pd.Series, indent_level: int = 0) -> str
     change_indicator = "[UPDATED] " if changes and changes != ["New Campaign"] else ""
     new_indicator = "[NEW] " if changes and changes == ["New Campaign"] else ""
 
+    # Format Event ID with a clean, clickable link
+    event_id = campaign["Event ID"]
+    event_link = format_event_link(event_id)
+
     lines = [
         f"{indent}{change_indicator}{new_indicator}{campaign['Retailer']} - {campaign['Tactic Brand']}",
         f"{indent}Event: {campaign['Event Name']}",
+        f"{indent}Event ID: {event_id} (<a href='{event_link}'>View in Shopperations</a>)",
         f"{indent}Product: {campaign['Tactic Product']}",
         f"{indent}Campaign: {campaign['Tactic Name']}",
     ]
 
+    if campaign["Tactic Description"]:
+        lines.append(f"{indent}Description: {campaign['Tactic Description']}")
     if campaign["Tactic Vendor"]:
         lines.append(f"{indent}Vendor: {campaign['Tactic Vendor']}")
 
@@ -420,6 +435,9 @@ def read_and_clean_data(file_path: Path) -> pd.DataFrame:
         .str.contains("Grand Total|Total|Summary", na=False, case=False)
     ]
 
+    # Convert Event ID to integer
+    df["Event ID"] = df["Event ID"].astype(int)
+
     # Convert dates
     for date_col in DATE_COLUMNS:
         df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
@@ -434,6 +452,7 @@ def read_and_clean_data(file_path: Path) -> pd.DataFrame:
         df["Tactic Allocated Budget"], errors="coerce"
     ).fillna(0)
     df["Tactic Vendor"] = df["Tactic Vendor"].fillna("")
+    df["Tactic Description"] = df["Tactic Description"].fillna("")
 
     # Sort for consistency
     df = df.sort_values(["Tactic Start Date", "Retailer", "Tactic Brand"])
@@ -631,6 +650,11 @@ def get_unique_filename(base_path: Path) -> Path:
     return new_path
 
 
+def format_event_link(event_id: int) -> str:
+    """Format event ID as a Shopperations link"""
+    return f"https://cemm-ajinomoto.shopperationsapp.com/events/{event_id}/spend"
+
+
 def write_campaign_details(
     md_file: TextIO, campaign: pd.Series, indent_level: int = 0
 ) -> None:
@@ -651,8 +675,14 @@ def write_campaign_details(
         md_file.write(f"{indent}  - 🆕 **New Campaign**\n")
 
     md_file.write(f"{indent}  - Event: {campaign['Event Name']}\n")
+    # Format Event ID as a compact clickable link
+    event_id = campaign["Event ID"]
+    event_link = format_event_link(event_id)
+    md_file.write(f"{indent}  - Event ID: [View {event_id}]({event_link})\n")
     md_file.write(f"{indent}  - Product: {campaign['Tactic Product']}\n")
     md_file.write(f"{indent}  - Campaign: {campaign['Tactic Name']}\n")
+    if campaign["Tactic Description"]:
+        md_file.write(f"{indent}  - Description: {campaign['Tactic Description']}\n")
     if campaign["Tactic Vendor"]:
         md_file.write(f"{indent}  - Vendor: {campaign['Tactic Vendor']}\n")
     md_file.write(f"{indent}  - Dates: {start_date} to {end_date}\n")
