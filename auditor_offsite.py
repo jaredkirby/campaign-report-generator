@@ -12,7 +12,7 @@ Improvements TODO:
     - report_generators.py - Report generation logic
     - email_handler.py - Email functionality
     - utils.py - Shared utilities
-- Separate constants to congif file.
+- Separate constants to config file.
 - Improve error handling and logging.
 - Add context managers for file operations and resource handling.
 - Add more specific type hints using TypeVar and Protocol.
