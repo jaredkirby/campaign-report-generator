@@ -1,30 +1,7 @@
-"""
-Campaign Report Generator
-
-Generates formatted Markdown and Text reports for tracking media campaign status across different retailers.
-Tracks changes between report generations and maintains historical data for comparison.
-Sends generated reports via email using configured SMTP server.
-
-Improvements TODO:
-- Create separate modules:
-    - config.py - Configuration handling
-    - data_processing.py - Data loading and processing
-    - report_generators.py - Report generation logic
-    - email_handler.py - Email functionality
-    - utils.py - Shared utilities
-- Separate constants to config file.
-- Improve error handling and logging.
-- Add context managers for file operations and resource handling.
-- Add more specific type hints using TypeVar and Protocol.
-- Use dataclasses for data containers.
-- Replace string concatenation with f-strings.
-- Add unit tests for core functions.
-    
-"""
-
 import os
 import sys
 import yaml
+import json
 import logging
 import hashlib
 import argparse
@@ -70,6 +47,19 @@ MONITORED_FIELDS = [
 ]
 
 DATE_COLUMNS = ["Tactic Start Date", "Tactic End Date"]
+
+BASE_DIR = Path(__file__).parent.parent
+DATA_DIR = BASE_DIR / "data"
+UPLOAD_DIR = DATA_DIR / "uploads"
+OUTPUT_DIR = DATA_DIR / "output"
+HISTORY_DIR = DATA_DIR / "history"
+CONFIG_DIR = DATA_DIR / "config"
+
+
+def ensure_directories() -> None:
+    """Create required directories if they don't exist"""
+    for directory in [UPLOAD_DIR, OUTPUT_DIR, HISTORY_DIR, CONFIG_DIR]:
+        directory.mkdir(parents=True, exist_ok=True)
 
 
 # Custom Exceptions
@@ -118,6 +108,7 @@ class EmailConfig:
     sender_email: str = None
     primary_recipients: List[str] = None
     cc_recipients: List[str] = None
+    sender_password: str = None
 
     def __post_init__(self):
         """Validate configuration after initialization"""
@@ -152,12 +143,26 @@ class EmailConfig:
             if email.strip() and email.strip() not in primary_recipients
         ]
 
+        # Add the missing return statement
         return cls(
             smtp_server=os.getenv("EMAIL_SMTP_SERVER", "smtp.office365.com"),
             smtp_port=int(os.getenv("EMAIL_SMTP_PORT", "587")),
             sender_email=os.getenv("EMAIL_SENDER"),
+            sender_password=os.getenv("EMAIL_SENDER_PASSWORD"),
             primary_recipients=primary_recipients,
             cc_recipients=cc_recipients,
+        )
+
+    @classmethod
+    def from_dict(cls, config_data: dict) -> "EmailConfig":
+        """Create EmailConfig from configuration dictionary"""
+        return cls(
+            smtp_server=config_data.get("smtp_server", "smtp.office365.com"),
+            smtp_port=int(config_data.get("smtp_port", "587")),
+            sender_email=config_data.get("sender_email"),
+            primary_recipients=config_data.get("primary_recipients", []),
+            cc_recipients=config_data.get("cc_recipients", []),
+            sender_password=config_data.get("sender_password"),
         )
 
     def validate(self) -> bool:
@@ -178,10 +183,8 @@ class CampaignReportEmailer:
         self.config = config
         self.logger = logging.getLogger(__name__)
 
-        # Get password from environment
-        self.sender_password = os.getenv("EMAIL_SENDER_PASSWORD")
-        if not self.sender_password:
-            raise ValueError("Email sender password not found in environment variables")
+        if not config.sender_password:
+            raise ValueError("Email sender password not configured")
 
     def setup_email_client(self) -> smtplib.SMTP:
         """Initialize and authenticate SMTP client"""
@@ -189,7 +192,7 @@ class CampaignReportEmailer:
         try:
             server = smtplib.SMTP(self.config.smtp_server, self.config.smtp_port)
             server.starttls()
-            server.login(self.config.sender_email, self.sender_password)
+            server.login(self.config.sender_email, self.config.sender_password)
             return server
         except Exception as e:
             if server is not None:
@@ -294,7 +297,8 @@ class Config:
     """Configuration container for the report generator"""
 
     input_csv: Path
-    output_dir: Path
+    output_dir: Path = OUTPUT_DIR
+    history_dir: Path = HISTORY_DIR
     email_template: Optional[str] = None
 
     @classmethod
@@ -304,12 +308,14 @@ class Config:
             with open(path) as f:
                 data = yaml.safe_load(f)
 
-            if not all(key in data for key in ["input_offsite_csv", "output_dir"]):
-                raise DataValidationError("Missing required configuration keys")
+            # Ensure we have the input CSV path
+            if "input_offsite_csv" not in data:
+                raise DataValidationError("Missing required input_offsite_csv key")
 
             return cls(
                 input_csv=Path(data["input_offsite_csv"]),
-                output_dir=Path(data["output_dir"]),
+                output_dir=Path(data.get("output_dir", OUTPUT_DIR)),
+                history_dir=Path(data.get("history_dir", HISTORY_DIR)),
                 email_template=data.get("email_template"),
             )
         except (yaml.YAMLError, IOError) as e:
@@ -478,16 +484,8 @@ def read_and_clean_data(file_path: Path) -> pd.DataFrame:
     return df
 
 
-def load_historical_data(history_dir: Path) -> Optional[pd.DataFrame]:
-    """
-    Load the previous version of the campaign data
-
-    Args:
-        history_dir: Directory containing historical data
-
-    Returns:
-        Optional[DataFrame]: Historical campaign data if available
-    """
+def load_historical_data(history_dir: Path = HISTORY_DIR) -> Optional[pd.DataFrame]:
+    """Load the previous version of the campaign data"""
     latest_file = history_dir / "campaign_history_latest.json"
 
     if not latest_file.exists():
@@ -504,17 +502,10 @@ def load_historical_data(history_dir: Path) -> Optional[pd.DataFrame]:
         return None
 
 
-def save_historical_data(df: pd.DataFrame, history_dir: Path) -> Optional[Path]:
-    """
-    Save the current version of the campaign data
-
-    Args:
-        df: Current campaign data
-        history_dir: Directory to save historical data
-
-    Returns:
-        Optional[Path]: Path to saved history file
-    """
+def save_historical_data(
+    df: pd.DataFrame, history_dir: Path = HISTORY_DIR
+) -> Optional[Path]:
+    """Save the current version of the campaign data"""
     history_dir.mkdir(exist_ok=True)
 
     df_to_save = df.copy()
@@ -969,19 +960,27 @@ def generate_email_report(df: pd.DataFrame, output_path: Path) -> None:
 def send_reports_by_email(
     md_path: Path,
     txt_path: Path,
+    email_config: Optional[EmailConfig] = None,
 ) -> bool:
     """
-    Convenience function to send campaign reports via email using environment configuration
+    Send campaign reports via email
 
     Args:
         md_path: Path to markdown report file
         txt_path: Path to text report file
+        email_config: Optional email configuration, will use env vars if not provided
 
     Returns:
         bool: True if email was sent successfully
     """
     try:
-        config = EmailConfig.from_env()
+        # Use provided config or fall back to environment variables
+        config = email_config or EmailConfig.from_env()
+
+        if not config:
+            logging.error("No email configuration available")
+            return False
+
         emailer = CampaignReportEmailer(config)
         return emailer.send_campaign_report(
             md_path, txt_path, report_date=datetime.now().strftime("%Y-%m-%d")
@@ -1015,22 +1014,11 @@ def cleanup_old_reports(output_dir: Path, days_to_keep: int = 30) -> None:
 
 def generate_reports(
     df: pd.DataFrame,
-    history_dir: Path,
-    output_dir: Path,
+    history_dir: Path = HISTORY_DIR,
+    output_dir: Path = OUTPUT_DIR,
     cleanup_days: Optional[int] = 30,
 ) -> Tuple[Path, Path]:
-    """
-    Generate both markdown and email reports
-
-    Args:
-        df: Campaign data
-        history_dir: Directory for historical data
-        output_dir: Directory for output files
-        cleanup_days: Days to keep old reports (None to skip cleanup)
-
-    Returns:
-        Tuple[Path, Path]: Paths to generated markdown and email reports
-    """
+    """Generate both markdown and email reports"""
     logging.info("Generating markdown and email reports")
 
     # Clean up old reports if requested
@@ -1052,65 +1040,55 @@ def generate_reports(
     return md_path, email_path
 
 
-def main(config_path: str) -> None:
-    """
-    Main function to run the campaign report generator and send email reports
-
-    Args:
-        config_path: Path to configuration YAML file
-    """
+def main(config_path: str) -> dict:
+    """Main function to run the campaign report generator and send email reports"""
     try:
         setup_logging()
-        config = Config.from_yaml(config_path)
+        ensure_directories()
 
-        # Ensure output directory exists
-        config.output_dir.mkdir(parents=True, exist_ok=True)
+        config = Config.from_yaml(config_path)
 
         # Read and process data
         df = read_and_clean_data(config.input_csv)
-
-        # Set up history directory and process changes
-        history_dir = config.output_dir / "campaign_history"
-        history_dir.mkdir(exist_ok=True)
-
-        # Load historical data and find changes once
-        historical_df = load_historical_data(history_dir)
+        historical_df = load_historical_data(config.history_dir)
         df = find_changes(df, historical_df)
+        history_file = save_historical_data(df, config.history_dir)
 
-        # Save current data as historical
-        save_historical_data(df, history_dir)
-
-        # Generate both reports using the processed dataframe
-        # Add cleanup of reports older than 30 days
+        # Generate reports
         md_path, email_path = generate_reports(
-            df,
-            history_dir,
-            config.output_dir,
-            cleanup_days=30,  # Can be made configurable through YAML if needed
-        )
-        logging.info(
-            f"Reports generated and saved to:\nMarkdown: {md_path}\nEmail: {email_path}"
+            df, config.history_dir, config.output_dir, cleanup_days=30
         )
 
-        # Send email if configured
-        if os.getenv("EMAIL_SENDER"):
-            logging.info("Email configuration found. Attempting to send reports...")
-            success = send_reports_by_email(md_path=md_path, txt_path=email_path)
-            if success:
-                logging.info("Campaign reports sent successfully via email")
-            else:
-                logging.error("Failed to send campaign reports via email")
-        else:
-            logging.info("No email configuration found. Skipping email send.")
-
-        logging.info("Campaign report generation completed")
+        # Print output for debugging
+        print(
+            json.dumps(
+                {
+                    "success": True,
+                    "markdown_path": str(md_path),
+                    "email_path": str(email_path),
+                    "history_saved": str(history_file) if history_file else None,
+                    "campaign_count": len(df),
+                    "changes_detected": len([c for c in df["changes"] if c]),
+                }
+            )
+        )
+        return {
+            "success": True,
+            "markdown_path": str(md_path),
+            "email_path": str(email_path),
+            "history_saved": str(history_file) if history_file else None,
+            "campaign_count": len(df),
+            "changes_detected": len([c for c in df["changes"] if c]),
+        }
 
     except CampaignReportError as e:
-        logging.error(f"Failed to generate reports: {e}")
-        sys.exit(1)
+        error_msg = f"Failed to generate reports: {e}"
+        print(json.dumps({"success": False, "error": error_msg}))
+        return {"success": False, "error": error_msg}
     except Exception as e:
-        logging.error(f"Unexpected error: {e}")
-        sys.exit(1)
+        error_msg = f"Unexpected error: {e}"
+        print(json.dumps({"success": False, "error": error_msg}))
+        return {"success": False, "error": error_msg}
 
 
 if __name__ == "__main__":
@@ -1119,7 +1097,13 @@ if __name__ == "__main__":
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
-        "--config", type=str, default="config.yaml", help="Path to configuration file"
+        "--config", type=str, required=True, help="Path to configuration file"
     )
     args = parser.parse_args()
-    main(args.config)
+
+    result = main(args.config)
+    if result["success"]:
+        sys.exit(0)
+    else:
+        print(f"Error: {result['error']}", file=sys.stderr)
+        sys.exit(1)
