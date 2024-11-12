@@ -32,6 +32,17 @@ import ReactMarkdown from "react-markdown";
 
 type ProcessingStatus = "idle" | "ready" | "processing" | "success" | "error";
 
+interface ProcessResult {
+  success: boolean;
+  message?: string;
+  data?: {
+    markdown_path?: string;
+    email_path?: string;
+    campaign_count?: number;
+    changes_detected?: number;
+  };
+}
+
 export function CampaignReportProcessor() {
   const [file, setFile] = useState<File | null>(null);
   const [processing, setProcessing] = useState(false);
@@ -127,51 +138,114 @@ export function CampaignReportProcessor() {
     setMarkdownContent("");
   
     try {
+      // Show upload progress
+      setProgress(20);
+  
+      // Validate file size for Vercel limits (max 50MB)
+      if (file.size > 50 * 1024 * 1024) {
+        throw new Error("File size exceeds 50MB limit");
+      }
+  
       const formData = new FormData();
       formData.append("file", file);
       formData.append("primaryEmails", JSON.stringify(primaryEmails));
       formData.append("ccEmails", JSON.stringify(ccEmails));
   
+      // Add request timeout for Vercel's 10s limit
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 9500); // 9.5s timeout
+  
+      setProgress(40);
+  
       const response = await fetch("/api/process", {
         method: "POST",
         body: formData,
-      });
+        signal: controller.signal,
+      }).finally(() => clearTimeout(timeout));
   
-      const result = await response.json();
-      console.log("Process API response:", result); // Debug log
+      setProgress(60);
   
+      const result = await response.json() as ProcessResult;
+      
       if (!result.success) {
         throw new Error(result.message || "Failed to process report");
       }
   
+      setProgress(80);
+  
       // Fetch the markdown content
       if (result.data?.markdown_path) {
         const filename = result.data.markdown_path.split("/").pop();
-        if (filename) {
-          try {
-            const markdownResponse = await fetch(`/api/report/md/${filename}`);
-            if (markdownResponse.ok) {
-              const content = await markdownResponse.text();
-              console.log('Received markdown content:', content.substring(0, 100)); // Debug log
-              setMarkdownContent(content);
-            } else {
-              const errorText = await markdownResponse.text();
-              console.error('Failed to fetch markdown:', errorText);
-              throw new Error(`Failed to fetch report: ${markdownResponse.statusText}`);
-            }
-          } catch (err) {
-            console.error('Error fetching markdown:', err);
-            throw err;
-          }
+        if (!filename) {
+          throw new Error("Invalid markdown filename");
         }
+  
+        // Add timeout for markdown fetch
+        const mdController = new AbortController();
+        const mdTimeout = setTimeout(() => mdController.abort(), 9500);
+  
+        try {
+          const markdownResponse = await fetch(`/api/report/md/${filename}`, {
+            signal: mdController.signal,
+            headers: {
+              'Cache-Control': 'no-cache',
+              'Pragma': 'no-cache'
+            }
+          }).finally(() => clearTimeout(mdTimeout));
+  
+          if (!markdownResponse.ok) {
+            const errorText = await markdownResponse.text();
+            console.error('Markdown fetch error:', errorText);
+            throw new Error(`Failed to fetch report: ${markdownResponse.statusText}`);
+          }
+  
+          const content = await markdownResponse.text();
+          
+          // Validate content
+          if (!content || content.trim().length === 0) {
+            throw new Error("Received empty report content");
+          }
+  
+          setMarkdownContent(content);
+  
+          // Log successful processing metrics
+          if (result.data?.campaign_count) {
+            console.log(`Processed ${result.data.campaign_count} campaigns`);
+          }
+          if (result.data?.changes_detected) {
+            console.log(`Detected ${result.data.changes_detected} changes`);
+          }
+        } catch (err) {
+          if (err instanceof Error && err.name === 'AbortError') {
+            throw new Error("Report fetch timed out - please try again");
+          }
+          throw err;
+        }
+      } else {
+        throw new Error("No report was generated");
       }
   
       setStatus("success");
       setProgress(100);
+  
     } catch (err) {
       console.error("Error processing report:", err);
-      setError(err instanceof Error ? err.message : "An error occurred");
+      
+      // Handle specific error types
+      let errorMessage = "An error occurred";
+      if (err instanceof Error) {
+        if (err.name === 'AbortError') {
+          errorMessage = "Request timed out - please try again";
+        } else if (err.message.includes("Failed to fetch")) {
+          errorMessage = "Network error - please check your connection";
+        } else {
+          errorMessage = err.message;
+        }
+      }
+      
+      setError(errorMessage);
       setStatus("error");
+      setProgress(0);
     } finally {
       setProcessing(false);
     }

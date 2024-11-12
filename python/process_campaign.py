@@ -48,8 +48,20 @@ MONITORED_FIELDS = [
 
 DATE_COLUMNS = ["Tactic Start Date", "Tactic End Date"]
 
-BASE_DIR = Path(__file__).parent.parent
-DATA_DIR = BASE_DIR / "data"
+# BASE_DIR = Path(__file__).parent.parent
+# DATA_DIR = BASE_DIR / "data"
+# UPLOAD_DIR = DATA_DIR / "uploads"
+# OUTPUT_DIR = DATA_DIR / "output"
+# HISTORY_DIR = DATA_DIR / "history"
+# CONFIG_DIR = DATA_DIR / "config"
+
+# def ensure_directories() -> None:
+#    """Create required directories if they don't exist"""
+#    for directory in [UPLOAD_DIR, OUTPUT_DIR, HISTORY_DIR, CONFIG_DIR]:
+#        directory.mkdir(parents=True, exist_ok=True)
+
+BASE_DIR = Path(os.getenv("VERCEL_ROOT", os.getcwd()))
+DATA_DIR = BASE_DIR / ".vercel" / "output" / "data"
 UPLOAD_DIR = DATA_DIR / "uploads"
 OUTPUT_DIR = DATA_DIR / "output"
 HISTORY_DIR = DATA_DIR / "history"
@@ -59,7 +71,7 @@ CONFIG_DIR = DATA_DIR / "config"
 def ensure_directories() -> None:
     """Create required directories if they don't exist"""
     for directory in [UPLOAD_DIR, OUTPUT_DIR, HISTORY_DIR, CONFIG_DIR]:
-        directory.mkdir(parents=True, exist_ok=True)
+        os.makedirs(directory, exist_ok=True)
 
 
 # Custom Exceptions
