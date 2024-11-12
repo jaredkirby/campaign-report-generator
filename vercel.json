@@ -1,0 +1,11 @@
+{
+    "version": 2,
+    "buildCommand": "npm run build",
+    "installCommand": "npm install --force",
+    "framework": "nextjs",
+    "env": {
+      "EMAIL_SMTP_SERVER": "smtp.office365.com",
+      "EMAIL_SMTP_PORT": "587",
+      "PYTHON_VERSION": "3.11"
+    }
+  }
