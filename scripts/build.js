@@ -15,9 +15,18 @@ try {
     }
   });
 
-  // Install Python dependencies
-  console.log('Installing Python dependencies...');
-  execSync('pip install -r requirements.txt', { stdio: 'inherit' });
+  // Check if we're in Vercel environment
+  if (process.env.VERCEL) {
+    console.log('Installing Python in Vercel environment...');
+    // Use Python from Vercel runtime
+    execSync('python3.11 -m ensurepip', { stdio: 'inherit' });
+    execSync('python3.11 -m pip install --upgrade pip', { stdio: 'inherit' });
+    execSync('python3.11 -m pip install -r requirements.txt', { stdio: 'inherit' });
+  } else {
+    // Local development environment
+    console.log('Installing Python dependencies...');
+    execSync('pip install -r requirements.txt', { stdio: 'inherit' });
+  }
 } catch (error) {
   console.error('Error during build:', error);
   process.exit(1);
