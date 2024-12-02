@@ -41,5 +41,6 @@ __pycache__/
 archive/
 fancy/
 
-/output/
-/reports/
+output/
+reports/
+data/
